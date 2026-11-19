@@ -2,7 +2,7 @@
 # Stop the components started by run-local.sh.
 set -euo pipefail
 LOG_DIR="${LOG_DIR:-/tmp/fp-logs}"
-for name in receiver proxy sender; do
+for name in receiver proxy sender proxy-dead proxy-hang; do
   pidfile="$LOG_DIR/$name.pid"
   if [ -f "$pidfile" ]; then
     pid="$(cat "$pidfile")"

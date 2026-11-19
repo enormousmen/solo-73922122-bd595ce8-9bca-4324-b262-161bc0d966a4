@@ -11,14 +11,25 @@ Scenarios:
   1. baseline: no preset, full upload, hashes match on both ends;
   2. auto pause at N bytes, exact stop, backlog + FIN held, resume ->
      no loss / duplication / reordering (hash + byte count match);
-  3. pause exactly at N across multiple read blocks (odd N);
+  3. pause exactly at N across multiple read blocks (odd N), raw client
+     (no run-id header) keeps working byte-for-byte;
   4. manual pause / resume;
   5. reverse (r2c) pause still lets the upload finish, receipt delivered
      after resume;
   6. force-close interrupts paused direction and blocked write, tasks exit,
      control API and other connections stay usable;
   7. backpressure: while paused the sender cannot drain the whole sample and
-     proxy per-direction user-space backlog stays <= 256 KiB.
+     proxy per-direction user-space backlog stays <= 256 KiB;
+  8. run-id tagging: the sender's run_id is found at the proxy while the
+     upload is paused, and the looked-up connection id resumes that one run;
+  9. run-id lookup works with the preset paused at 0 bytes;
+ 10. concurrent equal-size uploads: each run_id resolves to its own
+     connection, resuming one leaves the others paused;
+ 11. (optional, needs PROXY_DEAD_API/PROXY_DEAD_TCP) target-connect failure
+     is recorded under the run_id and queryable after close;
+ 12. (optional, needs PROXY_HANG_API/PROXY_HANG_TCP) the connection is
+     queryable by run_id while the target connect is still in progress, and
+     force-close works in that phase.
 """
 
 from __future__ import annotations
@@ -35,6 +46,16 @@ PROXY_API = os.getenv("PROXY_API", "127.0.0.1:8080")
 SENDER_API = os.getenv("SENDER_API", "127.0.0.1:8081")
 RECEIVER_API = os.getenv("RECEIVER_API", "127.0.0.1:9101")
 PROXY_TCP = os.getenv("PROXY_TCP", "127.0.0.1:9000")
+# Optional extra proxy instances for the failure/lookup scenarios (see
+# scripts/run-local.sh WITH_DEAD_PROXY / WITH_HANG_PROXY).
+PROXY_DEAD_API = os.getenv("PROXY_DEAD_API")
+PROXY_DEAD_TCP = os.getenv("PROXY_DEAD_TCP")
+PROXY_HANG_API = os.getenv("PROXY_HANG_API")
+PROXY_HANG_TCP = os.getenv("PROXY_HANG_TCP")
+
+# Keep in sync with protocol.py (the smoke test is stdlib-only and does not
+# import the project modules).
+RUN_ID_MAGIC = b"TCPFAULT-RUNID "
 
 PASS, FAIL = "PASS", "FAIL"
 results: list[tuple[str, str, str]] = []
@@ -60,6 +81,48 @@ def http_json(host_port: str, method: str, path: str, body: dict | None = None,
     return json.loads(raw) if raw else {}
 
 
+def http_json_or_none(host_port: str, method: str, path: str,
+                      timeout: float = 10.0) -> dict | None:
+    """GET-style helper that returns None on 404 instead of raising."""
+    host, port = host_port.split(":")
+    conn = http.client.HTTPConnection(host, int(port), timeout=timeout)
+    conn.request(method, path)
+    resp = conn.getresponse()
+    raw = resp.read().decode()
+    conn.close()
+    if resp.status == 404:
+        return None
+    if resp.status >= 400:
+        raise RuntimeError(f"{method} {path} -> {resp.status}: {raw}")
+    return json.loads(raw) if raw else {}
+
+
+def wait_by_run(run_id: str, api: str = PROXY_API, timeout: float = 10.0) -> dict:
+    """Poll the proxy's by-run lookup until the record exists."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rec = http_json_or_none(api, "GET", f"/connections/by-run/{run_id}")
+        if rec is not None:
+            return rec
+        time.sleep(0.05)
+    raise TimeoutError(f"run {run_id} never appeared at proxy")
+
+
+def wait_by_run_paused(run_id: str, api: str = PROXY_API,
+                       timeout: float = 10.0) -> dict:
+    """Poll the by-run lookup until the c2r direction is paused."""
+    deadline = time.time() + timeout
+    rec = wait_by_run(run_id, api, timeout)
+    while time.time() < deadline:
+        rec = http_json_or_none(api, "GET", f"/connections/by-run/{run_id}")
+        if rec is None:
+            raise RuntimeError(f"run {run_id} vanished from proxy")
+        if not rec["closed"] and rec["directions"]["c2r"]["paused"]:
+            return rec
+        time.sleep(0.05)
+    raise TimeoutError(f"run {run_id} connection never paused: {rec}")
+
+
 def wait_sender(run_id: str, timeout: float = 90.0) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -70,8 +133,8 @@ def wait_sender(run_id: str, timeout: float = 90.0) -> dict:
     raise TimeoutError(f"sender run {run_id} did not finish")
 
 
-def start_send(size: int) -> dict:
-    return http_json(SENDER_API, "POST", "/send", {"size_bytes": size})
+def start_send(size: int, **extra) -> dict:
+    return http_json(SENDER_API, "POST", "/send", {"size_bytes": size, **extra})
 
 
 def newest_conn() -> dict | None:
@@ -172,6 +235,15 @@ def main() -> int:
     check("baseline sha256 match", run["hash_match"] is True)
     check("baseline receiver got EOF receipt",
           wait_receiver_count(before + 1) >= before + 1)
+    check("baseline run sent run-id header", run["run_id_header_sent"] is True)
+    # After completion the connection is retired but still findable by
+    # run_id, and the header bytes must not have been forwarded/counted.
+    rec = wait_by_run(run["run_id"])
+    check("baseline run findable by run_id after close",
+          rec["run_id"] == run["run_id"] and rec["closed"] is True)
+    check("run-id header not counted as payload bytes",
+          rec["directions"]["c2r"]["forwarded_bytes"] == size,
+          f"forwarded={rec['directions']['c2r']['forwarded_bytes']} size={size}")
 
     # 2. Auto pause, exact N, backlog+FIN held, resume --------------------- #
     n = 300_000
@@ -234,6 +306,7 @@ def main() -> int:
     sock, expected_hash = raw_upload(size, n2)
     conn = wait_conn_active()
     cid = conn["id"]
+    check("raw client connection has no run_id tag", conn["run_id"] is None)
     deadline = time.time() + 10
     while time.time() < deadline:
         conn = http_json(PROXY_API, "GET", f"/connections/{cid}")
@@ -352,6 +425,140 @@ def main() -> int:
     run = wait_sender(run["run_id"])
     check("backpressure test finishes clean", run["hash_match"] is True)
     clear_preset()
+
+    # 8. run-id tagging: find the paused upload by run_id, resume by id ---- #
+    n3 = 150_000
+    set_preset(c2r=n3)
+    run = start_send(size)
+    rid = run["run_id"]
+    rec = wait_by_run_paused(rid)
+    check("paused upload found by run_id", rec["run_id"] == rid)
+    check("by-run connection is active while paused",
+          rec["closed"] is False and rec["phase"] == "relay")
+    check("by-run pause stopped exactly at N",
+          rec["directions"]["c2r"]["forwarded_bytes"] == n3,
+          f"forwarded={rec['directions']['c2r']['forwarded_bytes']} N={n3}")
+    # Resume exactly this upload via the connection id from the lookup.
+    cid = rec["id"]
+    http_json(PROXY_API, "POST", f"/connections/{cid}/resume", {"direction": "c2r"})
+    run = wait_sender(rid)
+    check("resume via looked-up id -> done", run["phase"] == "done",
+          run.get("error") or "")
+    check("resume via looked-up id -> byte match", run["byte_match"] is True)
+    check("resume via looked-up id -> sha256 match", run["hash_match"] is True)
+    clear_preset()
+
+    # 9. run-id lookup with the preset paused at 0 bytes -------------------- #
+    set_preset(c2r=0)
+    run = start_send(size)
+    rid = run["run_id"]
+    rec = wait_by_run_paused(rid)
+    check("run_id queryable at 0-byte pause", rec["run_id"] == rid)
+    check("0-byte pause forwarded exactly 0",
+          rec["directions"]["c2r"]["forwarded_bytes"] == 0)
+    check("0-byte pause holds FIN back",
+          rec["directions"]["c2r"]["half_closed_delivered"] is False)
+    http_json(PROXY_API, "POST", f"/connections/{rec['id']}/resume",
+              {"direction": "c2r"})
+    run = wait_sender(rid)
+    check("0-byte pause resume -> hash match",
+          run["phase"] == "done" and run["hash_match"] is True,
+          run.get("error") or "")
+    clear_preset()
+
+    # 10. Concurrent equal-size uploads: one run_id per connection ---------- #
+    n4 = 200_000
+    set_preset(c2r=n4)
+    runs = [start_send(size) for _ in range(3)]  # identical sizes on purpose
+    rids = [r["run_id"] for r in runs]
+    recs = [wait_by_run_paused(rid) for rid in rids]
+    check("all concurrent runs resolved by run_id",
+          [r["run_id"] for r in recs] == rids)
+    check("run_ids map to distinct connections",
+          len({r["id"] for r in recs}) == 3)
+    check("all concurrent runs paused at the same N",
+          all(r["directions"]["c2r"]["forwarded_bytes"] == n4 for r in recs))
+    # Resume only the middle upload; the other two must stay paused.
+    http_json(PROXY_API, "POST", f"/connections/{recs[1]['id']}/resume",
+              {"direction": "c2r"})
+    done1 = wait_sender(rids[1])
+    check("single resumed run completes intact",
+          done1["phase"] == "done" and done1["hash_match"] is True,
+          done1.get("error") or "")
+    others_still_paused = True
+    for rid in (rids[0], rids[2]):
+        rec = http_json(PROXY_API, "GET", f"/connections/by-run/{rid}")
+        mid = http_json(SENDER_API, "GET", f"/sends/{rid}")
+        if rec["closed"] or not rec["directions"]["c2r"]["paused"]:
+            others_still_paused = False
+        if mid["phase"] not in ("connected", "uploaded-half-closing", "waiting-receipt"):
+            others_still_paused = False
+    check("other uploads stayed paused", others_still_paused)
+    # Resume the rest; everything finishes with matching hashes.
+    ok_rest = True
+    for rid in (rids[0], rids[2]):
+        rec = http_json(PROXY_API, "GET", f"/connections/by-run/{rid}")
+        http_json(PROXY_API, "POST", f"/connections/{rec['id']}/resume",
+                  {"direction": "c2r"})
+        done = wait_sender(rid)
+        ok_rest = ok_rest and done["phase"] == "done" and done["hash_match"] is True
+    check("remaining concurrent runs complete intact", ok_rest)
+    clear_preset()
+
+    # 11. Target-connect failure recorded under the run_id (optional) ------- #
+    if PROXY_DEAD_API and PROXY_DEAD_TCP:
+        dead_host, dead_port = PROXY_DEAD_TCP.split(":")
+        # Large payload: the sender is still writing when the proxy gives up
+        # on the target and resets the client side, so the run must fail.
+        run = start_send(big_size, host=dead_host, port=int(dead_port))
+        rid = run["run_id"]
+        deadline = time.time() + 10
+        rec = None
+        while time.time() < deadline:
+            rec = http_json_or_none(PROXY_DEAD_API, "GET",
+                                    f"/connections/by-run/{rid}")
+            if rec is not None and rec["closed"]:
+                break
+            time.sleep(0.05)
+        check("connect-failure record found by run_id",
+              rec is not None and rec["closed"] is True)
+        check("connect-failure record carries the run_id",
+              rec is not None and rec["run_id"] == rid)
+        check("connect-failure close reason recorded",
+              rec is not None and "connect target" in (rec["error"] or ""),
+              (rec or {}).get("error") or "")
+        run = wait_sender(rid)
+        check("sender run failed after target-connect failure",
+              run["phase"] == "failed")
+    else:
+        print("[SKIP] connect-failure scenario (set PROXY_DEAD_API/PROXY_DEAD_TCP)")
+
+    # 12. Queryable while the target connect is in progress (optional) ------ #
+    if PROXY_HANG_API and PROXY_HANG_TCP:
+        hang_host, hang_port = PROXY_HANG_TCP.split(":")
+        rid = "hangcheck" + os.urandom(4).hex()
+        sock = socket.create_connection((hang_host, int(hang_port)), timeout=5)
+        sock.sendall(RUN_ID_MAGIC + rid.encode() + b"\n")
+        sock.sendall(b"payload-bytes-held-back")
+        rec = wait_by_run(rid, PROXY_HANG_API)
+        check("connection queryable by run_id while connecting",
+              rec["run_id"] == rid and rec["closed"] is False)
+        check("connecting phase exposed",
+              rec["target_connected"] is False and rec["phase"] == "connecting",
+              f"phase={rec['phase']}")
+        # Force-close must also work while the target connect is hanging.
+        t0 = time.time()
+        resp = http_json(PROXY_HANG_API, "POST",
+                         f"/connections/{rec['id']}/force-close", {})
+        dt = time.time() - t0
+        check("force-close during connect returns fast", dt < 2.0, f"{dt:.3f}s")
+        rec2 = http_json(PROXY_HANG_API, "GET", f"/connections/by-run/{rid}")
+        check("force-closed-during-connect record keeps run_id + reason",
+              rec2["closed"] is True and rec2["run_id"] == rid
+              and bool(rec2["error"]))
+        sock.close()
+    else:
+        print("[SKIP] connecting-phase scenario (set PROXY_HANG_API/PROXY_HANG_TCP)")
 
     # Summary -------------------------------------------------------------- #
     failed = [r for r in results if r[0] == FAIL]

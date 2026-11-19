@@ -5,6 +5,15 @@ fixed local receiver endpoint.  For every connection, each direction
 (client->proxy->receiver and receiver->proxy->client) is pumped by its own
 asyncio task.
 
+A client (normally the sender) may start its stream with one ASCII line
+``TCPFAULT-RUNID <run-id>\\n`` (see protocol.py).  The proxy consumes that
+line, tags the connection with the run-id and never forwards it, so the
+sample payload keeps its exact byte count, SHA-256, pause point and FIN
+order.  Streams without a well-formed header are forwarded byte-for-byte.
+The connection is registered (and queryable by run-id) as soon as the header
+is read, i.e. already while the target connection is being established, and
+target-connect failures are recorded under the same run-id.
+
 Per direction the following can be configured (via the control API before a
 new connection arrives, or manually on a live connection):
 
@@ -37,10 +46,12 @@ import time
 import uuid
 from collections import deque
 from contextlib import suppress
-from typing import Deque, Dict, Literal, Optional
+from typing import Deque, Dict, Literal, Optional, Protocol as TypingProtocol
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+import protocol as wire
 
 # --------------------------------------------------------------------------- #
 # Configuration / limits
@@ -60,6 +71,12 @@ MAX_CLOSED_RECORDS = 200
 
 Direction = Literal["c2r", "r2c"]
 DIRECTIONS: tuple[Direction, Direction] = ("c2r", "r2c")
+
+
+class _ReaderLike(TypingProtocol):
+    """The pump only needs an async read(); see _SeededReader below."""
+
+    async def read(self, n: int = -1) -> bytes: ...
 
 
 def _now() -> float:
@@ -129,25 +146,37 @@ class DirState:
 
 
 class Conn:
+    """One client connection.
+
+    Created (and registered) as soon as the client connects, *before* the
+    optional run-id header is probed and before the target connection is
+    established, so its state is queryable during every phase.  The remote
+    streams only exist after `attach_remote`.
+    """
+
     def __init__(
         self,
         conn_id: str,
-        client_reader: asyncio.StreamReader,
+        client_reader: _ReaderLike,
         client_writer: asyncio.StreamWriter,
-        remote_reader: asyncio.StreamReader,
-        remote_writer: asyncio.StreamWriter,
         peer: tuple[str, int],
     ):
         self.id = conn_id
-        self.client_reader = client_reader
+        # run-id tag sent by the sender on the wire (None for raw clients).
+        self.run_id: Optional[str] = None
+        self.client_reader: _ReaderLike = client_reader
         self.client_writer = client_writer
-        self.remote_reader = remote_reader
-        self.remote_writer = remote_writer
+        self.remote_reader: Optional[asyncio.StreamReader] = None
+        self.remote_writer: Optional[asyncio.StreamWriter] = None
+        self.target_connected = False
         self.peer = peer
         self.created_at = _now()
         self.closed = False
         self.closed_at: Optional[float] = None
         self.error: Optional[str] = None
+        # Set by force-close / shutdown so a still-running target connect
+        # (e.g. towards a blackholed receiver) is cancelled promptly.
+        self.die_event: asyncio.Event = asyncio.Event()
         self.tasks: Dict[Direction, Optional[asyncio.Task]] = {
             "c2r": None,
             "r2c": None,
@@ -156,6 +185,19 @@ class Conn:
             "c2r": DirState("c2r", preset.c2r_pause_after),
             "r2c": DirState("r2c", preset.r2c_pause_after),
         }
+
+    def attach_remote(
+        self, remote_reader: asyncio.StreamReader, remote_writer: asyncio.StreamWriter
+    ) -> None:
+        self.remote_reader = remote_reader
+        self.remote_writer = remote_writer
+        self.target_connected = True
+
+    @property
+    def phase(self) -> str:
+        if self.closed:
+            return "closed"
+        return "relay" if self.target_connected else "connecting"
 
     # -- pause control ----------------------------------------------------- #
 
@@ -181,7 +223,10 @@ class Conn:
     def snapshot(self) -> dict:
         return {
             "id": self.id,
+            "run_id": self.run_id,
             "peer": f"{self.peer[0]}:{self.peer[1]}",
+            "phase": self.phase,
+            "target_connected": self.target_connected,
             "created_at": self.created_at,
             "closed": self.closed,
             "closed_at": self.closed_at,
@@ -206,7 +251,20 @@ class Registry:
 
     def retire(self, conn: Conn) -> None:
         self.active.pop(conn.id, None)
+        # Closed records (including target-connect failures) are evicted by
+        # the same maxlen rule as before.
         self.closed.appendleft(conn.snapshot())
+
+    def find_by_run(self, run_id: str) -> Optional[dict]:
+        """Newest state for a sender run-id: active connection wins, then the
+        most recent closed record (which carries the close reason)."""
+        for conn in self.active.values():
+            if conn.run_id == run_id:
+                return conn.snapshot()
+        for record in self.closed:
+            if record.get("run_id") == run_id:
+                return record
+        return None
 
     def list(self) -> list[dict]:
         # Newest first: active connections, then closed records.
@@ -214,6 +272,73 @@ class Registry:
 
 
 registry = Registry()
+
+
+# --------------------------------------------------------------------------- #
+# Optional run-id header (sender -> proxy, consumed here, never forwarded)
+# --------------------------------------------------------------------------- #
+
+
+class _SeededReader:
+    """Reader shim for the c2r direction: serves the payload bytes that were
+    already consumed from the socket while probing for the run-id header,
+    then delegates to the real stream.  `eof` means the client half-closed
+    during the probe, so EOF follows the seed bytes."""
+
+    def __init__(self, seed: bytes, reader: asyncio.StreamReader, eof: bool):
+        self._seed = seed
+        self._reader = reader
+        self._eof = eof
+
+    async def read(self, n: int = -1) -> bytes:
+        if self._seed:
+            data, self._seed = self._seed[:n], self._seed[n:]
+            return data
+        if self._eof:
+            return b""
+        return await self._reader.read(n)
+
+
+async def _probe_run_id(
+    reader: asyncio.StreamReader,
+) -> tuple[bytes, Optional[str], bool]:
+    """Read the optional `TCPFAULT-RUNID <run-id>\\n` header line.
+
+    Returns (seed, run_id, eof): `seed` holds payload bytes that were
+    consumed while probing and must be forwarded before anything else;
+    `run_id` is set only when a well-formed header was present (its bytes are
+    NOT part of the seed — they are consumed by the proxy); `eof` means the
+    client half-closed during the probe.
+
+    A stream without a well-formed header is forwarded byte-for-byte: any
+    probed bytes (partial magic, magic + malformed line, ...) become seed.
+    """
+    try:
+        head = await reader.readexactly(len(wire.MAGIC))
+    except asyncio.IncompleteReadError as exc:
+        return exc.partial, None, True
+    if head != wire.MAGIC:
+        return head, None, False
+    # Magic matched: read the run-id up to the newline (bounded).
+    buf = bytearray()
+    while True:
+        try:
+            ch = await reader.readexactly(1)
+        except asyncio.IncompleteReadError:
+            # EOF in the middle of the header line: everything read so far
+            # is payload for a stream that never completed a header.
+            return head + bytes(buf), None, True
+        if ch == b"\n":
+            break
+        buf += ch
+        if len(buf) > wire.MAX_RUN_ID_LEN:
+            # Too long to be a valid header: treat consumed bytes as payload.
+            return head + bytes(buf), None, False
+    run_id = bytes(buf).decode("ascii", "replace")
+    if not wire.is_valid_run_id(run_id):
+        # Magic-like prefix but not a valid header: payload, byte-for-byte.
+        return head + bytes(buf) + b"\n", None, False
+    return b"", run_id, False
 
 
 # --------------------------------------------------------------------------- #
@@ -232,6 +357,8 @@ async def _wait_resume(st: DirState, conn: Conn) -> None:
 
 async def pump(conn: Conn, direction: Direction) -> None:
     """Forward exactly one direction, honouring the pause/backlog rules."""
+    # Pumps only start after _connect_target() attached the remote streams.
+    assert conn.remote_reader is not None and conn.remote_writer is not None
     if direction == "c2r":
         reader, writer = conn.client_reader, conn.remote_writer
     else:
@@ -335,33 +462,85 @@ def _deliver_fin(writer: asyncio.StreamWriter, st: DirState) -> None:
 # --------------------------------------------------------------------------- #
 
 
+async def _connect_target(conn: Conn) -> bool:
+    """Establish the fixed target connection for an already-registered conn.
+
+    The connection (with its run-id, if the sender sent one) is queryable
+    via the control API while this connect is still in progress.  On failure
+    or force-close the conn is retired with the reason recorded.
+    """
+    connect = asyncio.ensure_future(
+        asyncio.open_connection(TARGET_HOST, TARGET_PORT, limit=STREAM_LIMIT)
+    )
+    died = asyncio.ensure_future(conn.die_event.wait())
+    try:
+        await asyncio.wait({connect, died}, return_when=asyncio.FIRST_COMPLETED)
+        if conn.closed:
+            connect.cancel()
+            try:
+                _r, remote_writer = await connect
+            except (asyncio.CancelledError, OSError):
+                pass  # cancelled in flight, or the connect itself failed
+            else:
+                # The connect completed right as we were told to die; do not
+                # leak the freshly established target connection.
+                remote_writer.close()
+            if conn.error is None:
+                conn.error = "force-closed while connecting to target"
+            return False
+        try:
+            remote_reader, remote_writer = connect.result()
+        except OSError as exc:
+            conn.error = (
+                f"connect target {TARGET_HOST}:{TARGET_PORT} failed: {exc!r}"
+            )
+            return False
+        conn.attach_remote(remote_reader, remote_writer)
+        return True
+    finally:
+        died.cancel()
+        if not connect.done():
+            connect.cancel()
+
+
 async def handle_client(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
 ) -> None:
     conn_id = uuid.uuid4().hex[:12]
     peer = client_writer.get_extra_info("peername") or ("?", 0)
-    try:
-        remote_reader, remote_writer = await asyncio.open_connection(
-            TARGET_HOST, TARGET_PORT, limit=STREAM_LIMIT
-        )
-    except OSError as exc:
-        client_writer.close()
-        with suppress(Exception):
-            await client_writer.wait_closed()
-        registry.closed.appendleft(
-            {
-                "id": conn_id,
-                "peer": f"{peer[0]}:{peer[1]}",
-                "closed": True,
-                "error": f"connect target {TARGET_HOST}:{TARGET_PORT} failed: {exc!r}",
-                "directions": {},
-            }
-        )
-        return
-
-    conn = Conn(conn_id, client_reader, client_writer, remote_reader, remote_writer, peer)
+    # Register immediately: the connection is queryable while the run-id
+    # header is being probed and while the target connection is established.
+    conn = Conn(conn_id, client_reader, client_writer, peer)
     registry.add(conn)
+
+    connected = False
+    try:
+        seed, run_id, seed_eof = await _probe_run_id(client_reader)
+        conn.run_id = run_id
+        if seed or seed_eof:
+            # Feed the probed payload bytes (and a possible early EOF) to the
+            # c2r pump ahead of the live socket; the pump logic is unchanged.
+            conn.client_reader = _SeededReader(seed, client_reader, seed_eof)
+        connected = await _connect_target(conn)
+    except OSError as exc:
+        # e.g. the client resets while the header is being probed.
+        conn.error = f"client connection failed before relay: {exc!r}"
+
+    if not connected:
+        # Target connect failed (or force-close/reset before relay): retire
+        # with the reason; the closed record keeps the run-id for lookup and
+        # is evicted by the usual closed-record rule.
+        conn.closed = True
+        conn.closed_at = _now()
+        conn.die_event.set()
+        try:
+            client_writer.close()
+            with suppress(Exception):
+                await client_writer.wait_closed()
+        finally:
+            registry.retire(conn)
+        return
 
     conn.tasks["c2r"] = asyncio.create_task(pump(conn, "c2r"), name=f"{conn_id}-c2r")
     conn.tasks["r2c"] = asyncio.create_task(pump(conn, "r2c"), name=f"{conn_id}-r2c")
@@ -374,7 +553,10 @@ async def handle_client(
     finally:
         conn.closed = True
         conn.closed_at = _now()
-        for writer in (client_writer, remote_writer):
+        conn.die_event.set()
+        for writer in (conn.client_writer, conn.remote_writer):
+            if writer is None:
+                continue
             try:
                 writer.close()
             except Exception:
@@ -383,7 +565,9 @@ async def handle_client(
             if not t.done():
                 t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        for writer in (client_writer, remote_writer):
+        for writer in (conn.client_writer, conn.remote_writer):
+            if writer is None:
+                continue
             with suppress(OSError, RuntimeError):
                 await writer.wait_closed()
         registry.retire(conn)
@@ -407,9 +591,12 @@ async def lifespan(app: FastAPI):
         # without leaving half-closed sockets behind.
         for conn in list(registry.active.values()):
             conn.closed = True
+            conn.die_event.set()
             for d in DIRECTIONS:
                 conn.dir[d].resume_event.set()
             for writer in (conn.client_writer, conn.remote_writer):
+                if writer is None:
+                    continue
                 with suppress(Exception):
                     writer.transport.abort()
         await asyncio.sleep(0)
@@ -419,9 +606,11 @@ app = FastAPI(
     title="TCP 故障代理 (TCP Fault Proxy)",
     description=(
         "单进程 TCP 故障代理：固定转发至本地接收端。可预设新连接每个方向在累计转发 "
-        "N 字节后暂停，查询连接、按连接恢复或强断。详见各接口说明。"
+        "N 字节后暂停，查询连接、按连接恢复或强断。发送器可在 TCP 流首行携带 "
+        "`TCPFAULT-RUNID <run-id>` 头部（仅存在于发送器↔代理链路，不转发给接收端），"
+        "随后即可用 GET /connections/by-run/{run_id} 按编号查到对应连接。详见各接口说明。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -490,6 +679,16 @@ async def get_connection(conn_id: str) -> dict:
     return registry.get_active(conn_id).snapshot()
 
 
+@app.get("/connections/by-run/{run_id}", tags=["control"])
+async def get_connection_by_run(run_id: str) -> dict:
+    """按发送器 run 编号查连接：活动连接优先，其次最近一条已关闭记录
+    （含建连失败的关闭原因）。关闭记录仍按原规则淘汰，淘汰后返回 404。"""
+    found = registry.find_by_run(run_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail=f"unknown run id {run_id}")
+    return found
+
+
 @app.post("/connections/{conn_id}/pause", response_model=OpResponse, tags=["control"])
 async def pause_connection(conn_id: str, body: PauseBody) -> OpResponse:
     """手动暂停某连接的某个方向（除自动阈值外的测试手段）。"""
@@ -522,9 +721,12 @@ async def force_close(conn_id: str) -> OpResponse:
     """
     conn = registry.get_active(conn_id)
     conn.closed = True  # wake any _wait_resume loop
+    conn.die_event.set()  # cancel a still-running target connect
     for d in DIRECTIONS:
         conn.dir[d].resume_event.set()
     for writer in (conn.client_writer, conn.remote_writer):
+        if writer is None:
+            continue
         try:
             writer.transport.abort()
         except Exception:

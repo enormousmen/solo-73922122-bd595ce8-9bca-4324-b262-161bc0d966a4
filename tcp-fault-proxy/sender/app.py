@@ -2,12 +2,19 @@
 
 FastAPI control plane + raw asyncio TCP uploader in one process:
 
-* POST /send   connects to the proxy (fixed target), uploads a deterministic
-               32 MiB sample, half-closes the write side (FIN), then keeps
-               reading until the receiver's receipt (JSON line) arrives and
-               the reverse direction reaches EOF;
+* POST /send   connects to the proxy (fixed target), prefixes the stream
+               with a one-line `TCPFAULT-RUNID <run-id>` header (consumed by
+               the proxy, never forwarded to the receiver), uploads a
+               deterministic 32 MiB sample, half-closes the write side
+               (FIN), then keeps reading until the receiver's receipt (JSON
+               line) arrives and the reverse direction reaches EOF;
 * GET  /sends  lists recent runs with byte counts, hashes and timing;
 * GET  /docs   interactive UI to launch a send and inspect the receipt.
+
+The run-id header lets the tester find this run's connection at the proxy
+(GET /connections/by-run/{run_id} on the proxy control API) and resume or
+force-close exactly that one upload.  It travels only on the sender<->proxy
+hop, so the receiver still sees exactly the sample bytes.
 
 The payload is a deterministic, reproducible byte stream (chained SHA-256
 blocks), so receiver and sender hashes can be compared byte-for-byte.  Blocks
@@ -28,6 +35,8 @@ from typing import Deque, Dict, Literal, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+import protocol as wire
+
 PROXY_HOST = os.getenv("SENDER_TARGET_HOST", "proxy")
 PROXY_PORT = int(os.getenv("SENDER_TARGET_PORT", "9000"))
 DEFAULT_SIZE = int(os.getenv("SENDER_DEFAULT_BYTES", str(32 * 1024 * 1024)))
@@ -47,6 +56,12 @@ class SendRequest(BaseModel):
     )
     host: Optional[str] = Field(default=None, description="覆盖默认代理主机（测试用）")
     port: Optional[int] = Field(default=None, description="覆盖默认代理端口（测试用）")
+    include_run_id_header: bool = Field(
+        default=True,
+        description="连接建立后先发送一行 TCPFAULT-RUNID 头部（默认开启，代理会消费该行"
+        "并据此刻在 /connections/by-run/{run_id} 查到本连接）。直连不识别该头部的"
+        "对端（如绕过代理直连接收端）时应关闭，否则该行会被计入载荷。",
+    )
 
 
 def _gen_block(seed: int, index: int) -> bytes:
@@ -63,13 +78,22 @@ def _gen_block(seed: int, index: int) -> bytes:
     return b"".join(parts)[:BLOCK_SIZE]
 
 
-async def _do_send(run_id: str, size: int, host: str, port: int) -> None:
+async def _do_send(
+    run_id: str, size: int, host: str, port: int, send_run_id_header: bool
+) -> None:
     run = runs[run_id]
     started = time.monotonic()
     reader = writer = None
     try:
         reader, writer = await asyncio.open_connection(host, port)
         run["phase"] = "connected"
+        if send_run_id_header:
+            # One header line on the sender<->proxy hop only: the proxy
+            # consumes it (tags the connection with this run-id) and never
+            # forwards it, so the receiver still sees exactly `size` bytes.
+            writer.write(wire.encode_header(run_id))
+            await writer.drain()
+            run["run_id_header_sent"] = True
         digest = hashlib.sha256()
         seed = int.from_bytes(uuid.uuid4().bytes[:4], "big")
         remaining = size
@@ -134,8 +158,11 @@ async def _do_send(run_id: str, size: int, host: str, port: int) -> None:
 
 app = FastAPI(
     title="本地发送器 (Local Sample Sender)",
-    description="通过故障代理上传采样包（默认 32 MiB），半关闭后读取接收端回执。",
-    version="1.0.0",
+    description=(
+        "通过故障代理上传采样包（默认 32 MiB），半关闭后读取接收端回执。"
+        "默认在 TCP 流首行携带 run-id 头部，代理据此刻按 run_id 查询对应连接。"
+    ),
+    version="1.1.0",
 )
 
 
@@ -151,7 +178,12 @@ async def health() -> dict:
 
 @app.post("/send", status_code=202)
 async def start_send(body: SendRequest) -> dict:
-    """启动一次上传（后台任务），立即返回 run id，再用 /sends/{id} 查回执。"""
+    """启动一次上传（后台任务），立即返回 run id，再用 /sends/{id} 查回执。
+
+    默认在 TCP 流首行携带 `TCPFAULT-RUNID <run_id>` 头部；代理消费该行后，
+    可在代理控制面用 GET /connections/by-run/{run_id} 查到本次上传对应的
+    连接（含暂停/积压/FIN 状态），再用该连接 id 单独恢复或强断这一笔上传。
+    """
     run_id = uuid.uuid4().hex[:12]
     run = {
         "run_id": run_id,
@@ -161,6 +193,7 @@ async def start_send(body: SendRequest) -> dict:
         "reverse_bytes": 0,
         "phase": "starting",
         "started_at": time.time(),
+        "run_id_header_sent": False,
         "receipt": None,
         "upload_sha256": None,
         "hash_match": None,
@@ -175,7 +208,13 @@ async def start_send(body: SendRequest) -> dict:
         if rid not in run_order:
             runs.pop(rid, None)
     asyncio.create_task(
-        _do_send(run_id, body.size_bytes, body.host or PROXY_HOST, body.port or PROXY_PORT),
+        _do_send(
+            run_id,
+            body.size_bytes,
+            body.host or PROXY_HOST,
+            body.port or PROXY_PORT,
+            body.include_run_id_header,
+        ),
         name=f"send-{run_id}",
     )
     return run
